@@ -1,5 +1,4 @@
 # Entra Flex Deprovision
-A script that checks an Entra ID group for new users and deprovisions the users from Flex as well as deletes any related orphaned task router user
 
 Watch a Microsoft Entra ID group for newly-added members and automatically deprovision each one from Twilio Flex — both the **Flex v4 User** identity and the **TaskRouter Worker** record.
 
@@ -17,7 +16,7 @@ Written as a single self-contained Bash script (`deprovision.sh`) — no runtime
    - **TaskRouter Worker step:** `GET https://taskrouter.twilio.com/v1/Workspaces/{WorkspaceSid}/Workers?FriendlyName={email}` to find the worker, then `DELETE /Workers/{sid}`, then verifies with a follow-up GET.
 4. Successfully processed users are added to state. Users that failed transiently are kept out of state so they retry next run. Users who leave the Entra group drop out of state too.
 
-The **first run** records the current membership as a baseline and takes no action. Only members added *after* that baseline are treated as new.
+**On the first run** (no `seen_users.txt` present), *every* current member of the group is processed. On subsequent runs only members added since the last run are processed.
 
 The **TaskRouter Worker delete step is opt-in.** Set `DELETE_TASKROUTER_WORKER=1` in `.env` to enable it. When enabled, the **TaskRouter Workspace SID** is auto-discovered from `GET https://flex-api.twilio.com/v1/Configuration` on each run — or set `TASKROUTER_WORKSPACE_SID` in `.env` to skip the discovery call. If discovery fails and no override is set, the Worker-delete step is skipped with a warning (Flex v4 deprovision still runs).
 
@@ -148,16 +147,19 @@ FLEX_INSTANCE_SID=GOxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 ## Running
 
-### First run (baseline)
+### First run
+
+Processes every current member of the group:
 
 ```bash
 ./deprovision.sh
-# → Baseline recorded: N member(s). No action taken.
+# → First run — no state file. Processing all N current member(s).
+# → New user: ...
 ```
 
 ### Every subsequent run
 
-Only members added *after* baseline get processed:
+Only members added since the last run get processed:
 
 ```bash
 ./deprovision.sh
@@ -227,10 +229,9 @@ If you're unsure which field to pick, run `DEBUG=1 ./deprovision.sh` and copy th
 
 `seen_users.txt` sits next to the script (one Entra user ID per line). It's how the script knows who's already been processed. Behavior:
 
-- **File missing** → first run records current members as the baseline and takes no action.
+- **File missing** → every current group member is treated as new and processed.
 - **File exists** → users in the group but not in the file are treated as new; failed users retry next run; users who left the group drop out of state.
-- Force a re-baseline: `rm seen_users.txt`.
-- Reprocess *every current member* on the next run: `: > seen_users.txt` (empty the file).
+- Force reprocessing of every current member: `rm seen_users.txt` or `: > seen_users.txt` (either works — a missing or empty state file causes everyone to be treated as new).
 
 **Do not commit `seen_users.txt`** — it's in `.gitignore` by default.
 
@@ -271,4 +272,3 @@ If you're unsure which field to pick, run `DEBUG=1 ./deprovision.sh` and copy th
 | `.env.example` | Template for the `.env` you create locally. |
 | `.gitignore` | Excludes `.env`, `seen_users.txt`, and other local artifacts. |
 | `README.md` | This file. |
-
