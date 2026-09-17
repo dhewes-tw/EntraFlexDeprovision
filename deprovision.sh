@@ -5,11 +5,12 @@
 # Required env vars: TENANT_ID CLIENT_ID CLIENT_SECRET ENTRA_GROUP_ID
 #                    TWILIO_API_KEY TWILIO_API_SECRET FLEX_INSTANCE_SID
 #
-# Graph API permission on the app registration: GroupMember.Read.All (application).
+# Graph API permission on the app registration: GroupMember.Read.All (application),
+# and User.Read.All (application) if DEBUG=1 is used.
 # Requires: curl, jq.
 #
-# State: seen_users.txt is written next to this script. First run baselines
-# the current members and takes no action.
+# State: seen_users.txt is written next to this script. If it doesn't exist,
+# every current member of the group is processed on the first run.
 
 set -euo pipefail
 

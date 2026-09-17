@@ -1,4 +1,4 @@
-# Entra Flex Deprovision
+# EntraFlex
 
 Watch a Microsoft Entra ID group for newly-added members and automatically deprovision each one from Twilio Flex — both the **Flex v4 User** identity and the **TaskRouter Worker** record.
 
@@ -269,6 +269,8 @@ If you're unsure which field to pick, run `DEBUG=1 ./deprovision.sh` and copy th
 | File | Purpose |
 | --- | --- |
 | `deprovision.sh` | Primary script (Bash + curl + jq). |
+| `deprovision.py` | Python 3.10+ equivalent, same behavior. |
+| `requirements.txt` | Python dependency (`requests`). Only needed if using `deprovision.py`. |
 | `.env.example` | Template for the `.env` you create locally. |
 | `.gitignore` | Excludes `.env`, `seen_users.txt`, and other local artifacts. |
 | `README.md` | This file. |
