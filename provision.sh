@@ -87,7 +87,8 @@ done
 
 # Provision defaults.
 FLEX_ROLES="${FLEX_ROLES:-agent}"
-FLEX_WORKER_JSON="${FLEX_WORKER_JSON:-{\}}"
+FLEX_WORKER_JSON="${FLEX_WORKER_JSON:-}"
+[ -z "$FLEX_WORKER_JSON" ] && FLEX_WORKER_JSON='{}'
 
 if ! echo "$FLEX_WORKER_JSON" | jq -e . >/dev/null 2>&1; then
   echo "FLEX_WORKER_JSON is not valid JSON: $FLEX_WORKER_JSON" >&2
