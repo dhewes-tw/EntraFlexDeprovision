@@ -1,15 +1,20 @@
 # EntraFlex
 
-Watch a Microsoft Entra ID group **or** an Entra Enterprise Application, and automatically deprovision users from Twilio Flex — both the **Flex v4 User** identity and (optionally) the **TaskRouter Worker** record.
+Two self-contained Bash scripts that sync Twilio Flex user identities to a Microsoft Entra source of truth:
 
-Two trigger modes, selected via `TRIGGER_MODE` in `.env`:
+| Script | Purpose |
+| --- | --- |
+| `provision.sh` | Push users **into** Flex via `POST /Users/Provision` |
+| `deprovision.sh` | Remove users **from** Flex (Flex v4 User + optional TaskRouter Worker) |
 
-| Mode | Watch target | Trigger event |
-| --- | --- | --- |
-| `group` (default) | An Entra ID group | User is **added** to the group |
-| `app` | An Entra Enterprise Application | User is **unassigned** (or their Entra account is deleted while assigned) |
+Both read users from the same Entra source and support two trigger modes via `TRIGGER_MODE` in `.env`:
 
-Written as a single self-contained Bash script (`deprovision.sh`) — no runtime, no dependencies beyond `curl` and `jq`.
+| Mode | Watch target | provision.sh acts on | deprovision.sh acts on |
+| --- | --- | --- | --- |
+| `group` (default) | An Entra ID group | every current member (skips ones already in Flex) | users **added** to the group since last run |
+| `app` | An Entra Enterprise Application | every currently-assigned user (skips ones already in Flex) | users **unassigned** since last run |
+
+No runtime, no dependencies beyond `curl` and `jq`.
 
 ---
 
@@ -225,6 +230,72 @@ Adjust the interval per your needs. Ensure the process running cron has read/wri
 
 ---
 
+## Provisioning users into Flex
+
+`provision.sh` walks the same Entra source (`TRIGGER_MODE=group` or `app`) and, for each user, either **skips** them (already in Flex) or **provisions** them via `POST /v4/Instances/{InstanceSid}/Users/Provision`.
+
+The script is idempotent — it performs `GET /Users?Username=<email>` first and skips any user that already exists in Flex. There is no state file. Safe to run repeatedly.
+
+### Body sent to `/Users/Provision`
+
+```json
+{
+  "username":  "<email from ENTRA_EMAIL_FIELD>",
+  "email":     "<same>",
+  "full_name": "<displayName from Entra, falls back to email>",
+  "roles":     ["agent"],
+  "worker":    {}
+}
+```
+
+### Provisioning-specific env vars (optional)
+
+```dotenv
+# Roles assigned to provisioned users. Comma-separated.
+# Valid values: agent, supervisor, admin.  Default: agent
+FLEX_ROLES=agent,supervisor
+
+# TaskRouter Worker attributes to attach at provision time, as a JSON string.
+# Sent verbatim as the "worker" field. Default: {}
+FLEX_WORKER_JSON={"attributes":{"channel.voice.capacity":10}}
+```
+
+### Running
+
+```bash
+./provision.sh
+# → User: Jane Doe <jane@contoso.com>
+#     GET https://flex-api.twilio.com/v4/Instances/GO.../Users?Username=jane%40contoso.com
+#     POST https://flex-api.twilio.com/v4/Instances/GO.../Users/Provision
+#     Body: {"username":"jane@contoso.com","email":"jane@contoso.com","full_name":"Jane Doe","roles":["agent"],"worker":{}}
+#     Response: HTTP 201
+#     Provisioned. Flex SID: FU...
+# → User: Bob Smith <bob@contoso.com>
+#     Already provisioned (Flex SID: FU...) — skipping
+# → Summary: 1 provisioned, 1 skipped, 0 failed.
+```
+
+Same auth requirements as `deprovision.sh` (Graph permissions and Twilio API key) — nothing extra to configure to run it.
+
+### Round-tripping with `deprovision.sh`
+
+The natural symmetric setup uses **app mode** on both sides — one Entra Enterprise App becomes the source of truth for Flex access:
+
+```dotenv
+TRIGGER_MODE=app
+ENTRA_ENTERPRISE_APP_SID=<service principal Object ID>
+```
+
+```bash
+# In the same cron interval:
+./provision.sh     # every current assignee ends up in Flex (skips existing)
+./deprovision.sh   # anyone unassigned since last run is cleaned up
+```
+
+Note that **group mode has different semantics on the two scripts**: `provision.sh` treats the group as an "allow list" (provision every current member), while `deprovision.sh` treats the group as a "kick list" (act on users **added** to the group). If you want a group to work as an access list end-to-end, prefer app mode or wire up a separate "kick" group for `deprovision.sh`.
+
+---
+
 ## Configuring the Entra → Flex username mapping
 
 Twilio Flex looks up users by their **Username**, typically an email. The script pulls that value from Entra using `ENTRA_EMAIL_FIELD`:
@@ -300,7 +371,8 @@ If you're unsure which field to pick, run `DEBUG=1 ./deprovision.sh` and copy th
 
 | File | Purpose |
 | --- | --- |
-| `deprovision.sh` | The script (Bash + curl + jq). |
+| `provision.sh` | Creates Flex Users for people currently in the Entra source (idempotent). |
+| `deprovision.sh` | Removes Flex Users (v4) and optionally TaskRouter Workers when Entra removes/unassigns them. |
 | `.env.example` | Template for the `.env` you create locally. |
 | `.gitignore` | Excludes `.env`, `seen_users.txt`, and other local artifacts. |
 | `README.md` | This file. |

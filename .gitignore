@@ -1,7 +1,7 @@
 # Secrets — never commit
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # Runtime state
 seen_users.txt
