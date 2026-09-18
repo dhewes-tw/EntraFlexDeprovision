@@ -1,6 +1,13 @@
 # EntraFlex
 
-Watch a Microsoft Entra ID group for newly-added members and automatically deprovision each one from Twilio Flex — both the **Flex v4 User** identity and the **TaskRouter Worker** record.
+Watch a Microsoft Entra ID group **or** an Entra Enterprise Application, and automatically deprovision users from Twilio Flex — both the **Flex v4 User** identity and (optionally) the **TaskRouter Worker** record.
+
+Two trigger modes, selected via `TRIGGER_MODE` in `.env`:
+
+| Mode | Watch target | Trigger event |
+| --- | --- | --- |
+| `group` (default) | An Entra ID group | User is **added** to the group |
+| `app` | An Entra Enterprise Application | User is **unassigned** (or their Entra account is deleted while assigned) |
 
 Written as a single self-contained Bash script (`deprovision.sh`) — no runtime, no dependencies beyond `curl` and `jq`.
 
@@ -8,15 +15,24 @@ Written as a single self-contained Bash script (`deprovision.sh`) — no runtime
 
 ## How it works
 
-1. On each run, the script fetches the Entra group's current *user* members via Microsoft Graph.
-2. It compares the returned user IDs against `seen_users.txt` (state file, one ID per line).
-3. For each user in the group but not yet in state, it:
-   - Reads a configurable Entra field (default `mail`, falling back to `userPrincipalName`) as the identifier used against Twilio.
-   - **Flex v4 User step:** `GET https://flex-api.twilio.com/v4/Instances/{InstanceSid}/Users?Username={email}` to find the `flex_user_sid`, then `POST /Users/Deprovision` with that SID, then verifies with a follow-up `GET /Users/{sid}`.
-   - **TaskRouter Worker step:** `GET https://taskrouter.twilio.com/v1/Workspaces/{WorkspaceSid}/Workers?FriendlyName={email}` to find the worker, then `DELETE /Workers/{sid}`, then verifies with a follow-up GET.
-4. Successfully processed users are added to state. Users that failed transiently are kept out of state so they retry next run. Users who leave the Entra group drop out of state too.
+Each run:
 
-**On the first run** (no `seen_users.txt` present), *every* current member of the group is processed. On subsequent runs only members added since the last run are processed.
+1. **Fetch users** — mode-specific:
+   - Group mode: paginate through `GET /groups/{ENTRA_GROUP_ID}/members/microsoft.graph.user` (nested groups, service principals, devices are filtered out).
+   - App mode: paginate through `GET /servicePrincipals/{ENTRA_ENTERPRISE_APP_SID}/appRoleAssignedTo`, keep only `principalType == "User"`, then `GET /users/{principalId}` per user to get the fields needed to resolve the Flex username.
+2. **Diff against state** — mode-specific:
+   - Group mode: `to_process = current_ids − seen_ids`. If `seen_users.txt` is missing, every current member is processed.
+   - App mode: `to_process = seen_ids − current_ids` (users that were assigned last run but not this run). If `assigned_users.tsv` is missing, the current assignees are baselined and no action is taken.
+3. **Cleanup, per user in `to_process`:**
+   - **Flex v4 User step** — `GET /v4/Instances/{InstanceSid}/Users?Username={email}` to find `flex_user_sid`, then `POST /Users/Deprovision`, then verify with a follow-up GET.
+   - **TaskRouter Worker step (opt-in)** — `GET /v1/Workspaces/{WS}/Workers?FriendlyName={email}`, then `DELETE /Workers/{sid}`, then verify.
+4. **Update state** — mode-specific:
+   - Group mode: state = current IDs minus failed IDs (so failures retry).
+   - App mode: state = TSV row (`id\tname\temail`) per currently-assigned user, plus rows for users whose cleanup failed (so they're seen again next run and retried).
+
+**Flex username resolution.** Both modes read the Flex username from a configurable Entra field via `ENTRA_EMAIL_FIELD` (default `mail,userPrincipalName`, comma-separated priority list — first non-empty wins; array fields like `otherMails`/`proxyAddresses` use the first element; `SMTP:` prefixes are stripped).
+
+**App-mode username snapshot.** In app mode, the resolved Flex username is written to the state file at snapshot time. This means users whose Entra account has been **fully deleted** (not just unassigned) still get cleaned up — the script uses the stored username instead of trying to fetch a user that no longer exists.
 
 The **TaskRouter Worker delete step is opt-in.** Set `DELETE_TASKROUTER_WORKER=1` in `.env` to enable it. When enabled, the **TaskRouter Workspace SID** is auto-discovered from `GET https://flex-api.twilio.com/v1/Configuration` on each run — or set `TASKROUTER_WORKSPACE_SID` in `.env` to skip the discovery call. If discovery fails and no override is set, the Worker-delete step is skipped with a warning (Flex v4 deprovision still runs).
 
@@ -60,24 +76,29 @@ The **TaskRouter Worker delete step is opt-in.** Set `DELETE_TASKROUTER_WORKER=1
 
 ### 1.4  Grant Microsoft Graph API permissions
 
-The app needs two application permissions on Microsoft Graph:
+The app needs Application permissions on Microsoft Graph. Which ones depend on the trigger mode you'll use:
 
-| Permission | Why |
-| --- | --- |
-| `GroupMember.Read.All` | To list the group's members |
-| `User.Read.All` | To read `mail`, `proxyAddresses`, etc. on each user |
+| Permission | Group mode | App mode | Why |
+| --- | :-: | :-: | --- |
+| `GroupMember.Read.All` | ✔ | | List the group's members |
+| `User.Read.All` | ✔ | ✔ | Read `mail`, `proxyAddresses`, etc. on each user |
+| `Application.Read.All` | | ✔ | Read the enterprise app's `appRoleAssignedTo` list |
+
+If you plan to use both modes at different times, add all three.
 
 Steps:
 
 1. On the app page → **API permissions → Add a permission → Microsoft Graph → Application permissions** (**not** Delegated — client-credentials scripts only see Application scopes).
-2. Search **`GroupMember.Read.All`** → check → **Add permissions**.
-3. Repeat: **Add a permission → Microsoft Graph → Application permissions → `User.Read.All`** → **Add permissions**.
-4. Back on the API permissions page, click **"Grant admin consent for &lt;your tenant&gt;"** → **Yes**.
+2. Add each permission you need (from the table above): search the name → check → **Add permissions**. Common combinations:
+   - Group mode only: `GroupMember.Read.All` + `User.Read.All`
+   - App mode only: `Application.Read.All` + `User.Read.All`
+   - Both modes: all three
+3. Back on the API permissions page, click **"Grant admin consent for &lt;your tenant&gt;"** → **Yes**.
 5. Both rows should now show a green check under **Status**. Wait ~30 seconds for propagation.
 
 If you don't see the "Grant admin consent" button, you don't have the directory role required — a tenant admin (Global Admin, Privileged Role Admin, or Cloud Application Admin) needs to click it.
 
-### 1.5  Find the group's Object ID
+### 1.5  Find the group's Object ID (group mode)
 
 1. Left nav → **Groups → All groups**.
 2. Click into the group you want to watch (create one first if needed — **New group → Security**).
@@ -85,6 +106,16 @@ If you don't see the "Grant admin consent" button, you don't have the directory 
 4. This is `ENTRA_GROUP_ID` in `.env`.
 
 The group may contain nested groups, service principals, or devices — the script filters to *user* members only and safely ignores the rest.
+
+### 1.6  Find the Enterprise App's Object ID (app mode)
+
+1. Left nav → **Applications → Enterprise applications** (**not** App registrations — those are different objects).
+2. Find and click the app whose assignments you want to watch (typically your Flex SSO app, but any Enterprise Application works).
+3. On the **Properties** page, copy the **Object ID** (a GUID — this is the service principal's Object ID, distinct from the Application ID / Client ID).
+4. This is `ENTRA_ENTERPRISE_APP_SID` in `.env`.
+5. Set `TRIGGER_MODE=app` in `.env`.
+
+Only users assigned via **Users and groups** (as User principals, not through nested groups) are detected. Group-based assignments to the Enterprise App won't fire the unassign trigger for individual users when they leave one of those groups — the app just sees the group as still assigned.
 
 ---
 
@@ -242,8 +273,9 @@ If you're unsure which field to pick, run `DEBUG=1 ./deprovision.sh` and copy th
 | Symptom | Fix |
 | --- | --- |
 | `curl (22)` / `Graph token request failed: HTTP 400 invalid_client` | `CLIENT_ID` or `CLIENT_SECRET` wrong, or the secret has expired. Regenerate a client secret in Entra. |
-| `Graph group-members request failed: HTTP 403 Authorization_RequestDenied` | App is missing `GroupMember.Read.All` (Application) with admin consent granted. See §1.4. |
-| `/users/{id} failed: HTTP 403` (in DEBUG mode) | App is missing `User.Read.All` (Application) with admin consent. See §1.4. |
+| `Graph group-members request failed: HTTP 403 Authorization_RequestDenied` | Group mode: app is missing `GroupMember.Read.All` (Application) with admin consent. See §1.4. |
+| `Graph appRoleAssignedTo request failed: HTTP 403 Authorization_RequestDenied` | App mode: app is missing `Application.Read.All` (Application) with admin consent. See §1.4. |
+| `/users/{id} failed: HTTP 403` (in DEBUG mode or in app mode) | App is missing `User.Read.All` (Application) with admin consent. See §1.4. |
 | `Directory_ObjectNotFound` on group members URL | `ENTRA_GROUP_ID` is not the group's Object ID (a GUID). Don't paste display name / mail nickname. |
 | `[skip] <name>: no value in any of [mail,userPrincipalName]` | The configured fields are empty on this user. Run `DEBUG=1` to see what's populated and adjust `ENTRA_EMAIL_FIELD`. |
 | `No Flex v4 user for <email> — nothing to deprovision` | Not an error — this user has no Flex v4 identity under that Username. The TaskRouter step still runs. |
@@ -259,7 +291,7 @@ If you're unsure which field to pick, run `DEBUG=1 ./deprovision.sh` and copy th
 
 - `.env` contains a client secret and an API key secret. `chmod 600` it, keep it out of source control (already in `.gitignore`), and rotate both if either is exposed.
 - The Twilio API key is **account-level** — anyone with it can act on your Twilio account. Use a dedicated key for this integration and revoke it in the Console if compromised.
-- The Entra client secret gives the app application-level access to `GroupMember.Read.All` and `User.Read.All` tenant-wide. Rotate it periodically per your organization's policy.
+- The Entra client secret gives the app application-level access to whichever Graph permissions you've granted (`GroupMember.Read.All`, `User.Read.All`, and/or `Application.Read.All`) tenant-wide. Rotate it periodically per your organization's policy.
 - The script does not log secrets, but `DEBUG=1` prints full user records including email addresses — take care where you redirect the output.
 
 ---

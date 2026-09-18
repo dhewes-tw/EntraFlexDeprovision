@@ -1,16 +1,28 @@
 #!/usr/bin/env bash
 #
-# Check an Entra ID group for new members and deprovision each from Twilio Flex.
+# Watch an Entra ID group OR an Entra Enterprise Application and deprovision
+# users from Twilio Flex (Flex v4 User + optional TaskRouter Worker) on trigger.
 #
-# Required env vars: TENANT_ID CLIENT_ID CLIENT_SECRET ENTRA_GROUP_ID
+# Trigger modes (TRIGGER_MODE env var):
+#   group  (default) — process users ADDED to ENTRA_GROUP_ID
+#   app              — process users UNASSIGNED from ENTRA_ENTERPRISE_APP_SID
+#
+# Required env vars: TENANT_ID CLIENT_ID CLIENT_SECRET
 #                    TWILIO_API_KEY TWILIO_API_SECRET FLEX_INSTANCE_SID
+# Group mode also requires: ENTRA_GROUP_ID
+# App mode also requires:   ENTRA_ENTERPRISE_APP_SID (service principal Object ID)
 #
-# Graph API permission on the app registration: GroupMember.Read.All (application),
-# and User.Read.All (application) if DEBUG=1 is used.
+# Graph API permissions (Application, admin-consented):
+#   Group mode:  GroupMember.Read.All  (+ User.Read.All if DEBUG=1)
+#   App mode:    Application.Read.All + User.Read.All
 # Requires: curl, jq.
 #
-# State: seen_users.txt is written next to this script. If it doesn't exist,
-# every current member of the group is processed on the first run.
+# State files (written next to this script):
+#   Group mode: seen_users.txt        — one Entra user ID per line
+#   App mode:   assigned_users.tsv    — "id\tname\temail" per line
+# Group mode: if no state file, all current members are processed.
+# App mode:   if no state file, the current assignees are baselined and no
+#             action is taken; subsequent runs process any user removed since.
 
 set -euo pipefail
 
@@ -30,12 +42,30 @@ fi
 : "${TENANT_ID:?missing}"
 : "${CLIENT_ID:?missing}"
 : "${CLIENT_SECRET:?missing}"
-: "${ENTRA_GROUP_ID:?missing}"
 : "${TWILIO_API_KEY:?missing}"
 : "${TWILIO_API_SECRET:?missing}"
 : "${FLEX_INSTANCE_SID:?missing}"
 
-STATE_FILE="$SCRIPT_DIR/seen_users.txt"
+# Trigger mode: 'group' (default) or 'app'. Selects which Entra resource to
+# watch, which required env var applies, and which state file to use.
+trigger_mode_raw="${TRIGGER_MODE:-group}"
+case "$trigger_mode_raw" in
+  group|Group|GROUP)
+    trigger_mode="group"
+    : "${ENTRA_GROUP_ID:?required when TRIGGER_MODE=group}"
+    STATE_FILE="$SCRIPT_DIR/seen_users.txt"
+    ;;
+  app|App|APP)
+    trigger_mode="app"
+    : "${ENTRA_ENTERPRISE_APP_SID:?required when TRIGGER_MODE=app}"
+    STATE_FILE="$SCRIPT_DIR/assigned_users.tsv"
+    ;;
+  *)
+    echo "Invalid TRIGGER_MODE '$trigger_mode_raw' — must be 'group' or 'app'" >&2
+    exit 1
+    ;;
+esac
+
 FLEX_BASE="https://flex-api.twilio.com/v4/Instances/$FLEX_INSTANCE_SID"
 
 # TaskRouter cleanup is opt-in. Enable by setting DELETE_TASKROUTER_WORKER=1
@@ -88,7 +118,34 @@ MEMBERS_JSON=$(mktemp)
 CURRENT_IDS=$(mktemp)
 NEW_IDS=$(mktemp)
 FAILED=$(mktemp)
-trap 'rm -f "$MEMBERS_JSON" "$CURRENT_IDS" "$NEW_IDS" "$FAILED"' EXIT
+ASSIGNMENT_IDS=$(mktemp)
+TO_PROCESS=$(mktemp)
+trap 'rm -f "$MEMBERS_JSON" "$CURRENT_IDS" "$NEW_IDS" "$FAILED" "$ASSIGNMENT_IDS" "$TO_PROCESS"' EXIT
+
+# Helper: given an Entra user ID present in MEMBERS_JSON, print id\tname\temail
+# to stdout — used to build both TO_PROCESS and the app-mode state file.
+extract_user_row() {
+  local uid="$1" member name email
+  member=$(jq --arg id "$uid" '.[] | select(.id == $id)' "$MEMBERS_JSON")
+  if [ -z "$member" ]; then
+    printf '%s\t%s\t%s\n' "$uid" "" ""
+    return
+  fi
+  name=$(echo "$member" | jq -r '.displayName // .id' | tr '\t' ' ')
+  email=$(echo "$member" | jq -r --arg fields "$ENTRA_EMAIL_FIELD" '
+    ($fields | split(",") | map(gsub("^\\s+|\\s+$"; ""))) as $priority |
+    ( first(
+        $priority[] as $f |
+        (.[$f]) |
+        if type == "array" then
+          (map(select(type == "string" and . != "")) | .[0] // empty)
+        elif type == "string" and . != "" then .
+        else empty end
+      ) // "" )
+    | sub("^(SMTP|smtp):"; "")
+  ')
+  printf '%s\t%s\t%s\n' "$uid" "$name" "$email"
+}
 
 # 1. Graph token (client credentials).
 token_resp=$(curl -sS -w $'\n%{http_code}' \
@@ -106,33 +163,70 @@ if [ "$token_status" != "200" ]; then
 fi
 TOKEN=$(echo "$token_body" | jq -r .access_token)
 
-# 2. Fetch group members, following @odata.nextLink pagination.
+# 2. Fetch users (mode-specific).
 echo '[]' > "$MEMBERS_JSON"
+
 if [ -n "${DEBUG:-}" ]; then
-  # In DEBUG mode, pull a broad set of common email-candidate fields so you can
-  # see what's actually populated on your directory's user objects.
-  debug_select="id,displayName,mail,userPrincipalName,otherMails,proxyAddresses,onPremisesUserPrincipalName,onPremisesSamAccountName,mailNickname,employeeId,userType"
-  url="https://graph.microsoft.com/v1.0/groups/$ENTRA_GROUP_ID/members/microsoft.graph.user?\$select=$debug_select"
+  # In DEBUG mode, pull a broad set of common email-candidate fields.
+  effective_select="id,displayName,mail,userPrincipalName,otherMails,proxyAddresses,onPremisesUserPrincipalName,onPremisesSamAccountName,mailNickname,employeeId,userType"
 else
-  url="https://graph.microsoft.com/v1.0/groups/$ENTRA_GROUP_ID/members/microsoft.graph.user?\$select=$select_fields"
+  effective_select="$select_fields"
 fi
-while [ -n "$url" ]; do
-  page_resp=$(curl -sS -w $'\n%{http_code}' -H "Authorization: Bearer $TOKEN" "$url")
-  page_status=$(echo "$page_resp" | tail -n1)
-  page=$(echo "$page_resp"        | sed '$d')
-  if [ "$page_status" != "200" ]; then
-    echo "Graph group-members request failed: HTTP $page_status" >&2
-    echo "URL: $url" >&2
-    echo "$page" >&2
-    if [ "$page_status" = "403" ]; then
-      echo "Hint: the app registration likely lacks GroupMember.Read.All (Application permission) with admin consent granted." >&2
+
+if [ "$trigger_mode" = "group" ]; then
+  # Group mode: paginate through the group's user members.
+  url="https://graph.microsoft.com/v1.0/groups/$ENTRA_GROUP_ID/members/microsoft.graph.user?\$select=$effective_select"
+  while [ -n "$url" ]; do
+    page_resp=$(curl -sS -w $'\n%{http_code}' -H "Authorization: Bearer $TOKEN" "$url")
+    page_status=$(echo "$page_resp" | tail -n1)
+    page=$(echo "$page_resp"        | sed '$d')
+    if [ "$page_status" != "200" ]; then
+      echo "Graph group-members request failed: HTTP $page_status" >&2
+      echo "URL: $url" >&2
+      echo "$page" >&2
+      [ "$page_status" = "403" ] && echo "Hint: app registration likely lacks GroupMember.Read.All (Application) with admin consent granted." >&2
+      exit 1
     fi
-    exit 1
-  fi
-  jq -s '.[0] + .[1].value' "$MEMBERS_JSON" <(echo "$page") > "$MEMBERS_JSON.tmp"
-  mv "$MEMBERS_JSON.tmp" "$MEMBERS_JSON"
-  url=$(echo "$page" | jq -r '."@odata.nextLink" // empty')
-done
+    jq -s '.[0] + .[1].value' "$MEMBERS_JSON" <(echo "$page") > "$MEMBERS_JSON.tmp"
+    mv "$MEMBERS_JSON.tmp" "$MEMBERS_JSON"
+    url=$(echo "$page" | jq -r '."@odata.nextLink" // empty')
+  done
+else
+  # App mode: paginate through the enterprise app's user assignments, then
+  # fetch each user's full profile so we can extract the Flex username field.
+  : > "$ASSIGNMENT_IDS"
+  url="https://graph.microsoft.com/v1.0/servicePrincipals/$ENTRA_ENTERPRISE_APP_SID/appRoleAssignedTo?\$select=principalId,principalType,principalDisplayName"
+  while [ -n "$url" ]; do
+    page_resp=$(curl -sS -w $'\n%{http_code}' -H "Authorization: Bearer $TOKEN" "$url")
+    page_status=$(echo "$page_resp" | tail -n1)
+    page=$(echo "$page_resp"        | sed '$d')
+    if [ "$page_status" != "200" ]; then
+      echo "Graph appRoleAssignedTo request failed: HTTP $page_status" >&2
+      echo "URL: $url" >&2
+      echo "$page" >&2
+      [ "$page_status" = "403" ] && echo "Hint: app registration likely lacks Application.Read.All (Application) with admin consent granted." >&2
+      exit 1
+    fi
+    echo "$page" | jq -r '.value[] | select(.principalType == "User") | .principalId' >> "$ASSIGNMENT_IDS"
+    url=$(echo "$page" | jq -r '."@odata.nextLink" // empty')
+  done
+  # Fetch full profile per assigned user.
+  while IFS= read -r pid; do
+    [ -z "$pid" ] && continue
+    user_resp=$(curl -sS -w $'\n%{http_code}' -H "Authorization: Bearer $TOKEN" \
+      "https://graph.microsoft.com/v1.0/users/$pid?\$select=$effective_select")
+    user_status=$(echo "$user_resp" | tail -n1)
+    user_body=$(echo "$user_resp"   | sed '$d')
+    if [ "$user_status" = "200" ]; then
+      jq -s '.[0] + [.[1]]' "$MEMBERS_JSON" <(echo "$user_body") > "$MEMBERS_JSON.tmp"
+      mv "$MEMBERS_JSON.tmp" "$MEMBERS_JSON"
+    else
+      echo "Warning: /users/$pid returned HTTP $user_status; stub-recording ID only." >&2
+      jq --arg id "$pid" '. + [{id: $id, displayName: ""}]' "$MEMBERS_JSON" > "$MEMBERS_JSON.tmp"
+      mv "$MEMBERS_JSON.tmp" "$MEMBERS_JSON"
+    fi
+  done < "$ASSIGNMENT_IDS"
+fi
 
 if [ -n "${DEBUG:-}" ]; then
   # /groups/{id}/members often returns trimmed user objects. In DEBUG mode we
@@ -141,7 +235,11 @@ if [ -n "${DEBUG:-}" ]; then
   # app registration and grant admin consent.
   user_select="id,displayName,mail,userPrincipalName,otherMails,proxyAddresses,onPremisesUserPrincipalName,onPremisesSamAccountName,onPremisesDistinguishedName,mailNickname,employeeId,userType,accountEnabled,givenName,surname,jobTitle,department,companyName"
   count=$(jq 'length' "$MEMBERS_JSON")
-  echo "=== DEBUG: $count member(s); fetching each via /users/{id} ==="
+  if [ "$trigger_mode" = "group" ]; then
+    echo "=== DEBUG: $count member(s); fetching each via /users/{id} ==="
+  else
+    echo "=== DEBUG: $count assignee(s) currently on enterprise app ==="
+  fi
   for i in $(seq 0 $((count - 1))); do
     mid=$(jq -r --argjson i "$i" '.[$i].id' "$MEMBERS_JSON")
     echo ""
@@ -248,45 +346,88 @@ fi
 
 jq -r '.[].id' "$MEMBERS_JSON" | sort -u > "$CURRENT_IDS"
 
-# 3. Diff: new = current - seen. On first run (no state file), everyone counts as new.
-if [ ! -f "$STATE_FILE" ]; then
-  cp "$CURRENT_IDS" "$NEW_IDS"
-  first_run_count=$(wc -l < "$NEW_IDS" | tr -d ' ')
-  echo "First run — no state file. Processing all $first_run_count current member(s)."
+# 3. Build TO_PROCESS (id\tname\temail) based on the trigger mode.
+: > "$TO_PROCESS"
+
+if [ "$trigger_mode" = "group" ]; then
+  # Group mode: new = current - seen. On first run, all current members are new.
+  if [ ! -f "$STATE_FILE" ]; then
+    cp "$CURRENT_IDS" "$NEW_IDS"
+    first_run_count=$(wc -l < "$NEW_IDS" | tr -d ' ')
+    echo "First run — no state file. Processing all $first_run_count current member(s)."
+  else
+    comm -23 "$CURRENT_IDS" <(sort -u "$STATE_FILE") > "$NEW_IDS"
+  fi
+
+  if [ ! -s "$NEW_IDS" ]; then
+    echo "No new users."
+    cp "$CURRENT_IDS" "$STATE_FILE"
+    exit 0
+  fi
+
+  while IFS= read -r uid; do
+    [ -n "$uid" ] && extract_user_row "$uid" >> "$TO_PROCESS"
+  done < "$NEW_IDS"
 else
-  comm -23 "$CURRENT_IDS" <(sort -u "$STATE_FILE") > "$NEW_IDS"
+  # App mode: removed = state IDs - current IDs. On first run, baseline only.
+  if [ ! -f "$STATE_FILE" ]; then
+    while IFS= read -r uid; do
+      [ -n "$uid" ] && extract_user_row "$uid"
+    done < "$CURRENT_IDS" > "$STATE_FILE"
+    baseline_count=$(wc -l < "$STATE_FILE" | tr -d ' ')
+    echo "First run — no state file. Baselined $baseline_count current assignee(s). No action taken."
+    exit 0
+  fi
+
+  STATE_IDS=$(mktemp)
+  REMOVED_IDS=$(mktemp)
+  awk -F'\t' '{print $1}' "$STATE_FILE" | sort -u > "$STATE_IDS"
+  comm -23 "$STATE_IDS" "$CURRENT_IDS" > "$REMOVED_IDS"
+
+  removed_count=$(wc -l < "$REMOVED_IDS" | tr -d ' ')
+  if [ "$removed_count" = "0" ]; then
+    echo "No users unassigned since last run."
+    # Refresh state to reflect any newly-added assignees.
+    while IFS= read -r uid; do
+      [ -n "$uid" ] && extract_user_row "$uid"
+    done < "$CURRENT_IDS" > "$STATE_FILE"
+    rm -f "$STATE_IDS" "$REMOVED_IDS"
+    exit 0
+  fi
+
+  # Look up each removed ID's stored row in the previous state.
+  while IFS= read -r uid; do
+    [ -z "$uid" ] && continue
+    row=$(awk -F'\t' -v id="$uid" '$1 == id {print; exit}' "$STATE_FILE")
+    if [ -z "$row" ]; then
+      echo "[warn] no state entry for unassigned user $uid — skipping"
+      continue
+    fi
+    echo "$row" >> "$TO_PROCESS"
+  done < "$REMOVED_IDS"
+  rm -f "$STATE_IDS" "$REMOVED_IDS"
 fi
 
-if [ ! -s "$NEW_IDS" ]; then
-  echo "No new users."
-  cp "$CURRENT_IDS" "$STATE_FILE"
-  exit 0
+# 5. Iterate TO_PROCESS: (id, name, email) — Flex v4 deprovision + TR worker delete.
+if [ ! -s "$TO_PROCESS" ]; then
+  case "$trigger_mode" in
+    group) echo "No new users." ;;
+    app)   echo "No users to process." ;;
+  esac
 fi
 
-# 5. For each new user: Flex v4 deprovision AND TaskRouter worker delete.
-while IFS= read -r user_id; do
-  member=$(jq --arg id "$user_id" '.[] | select(.id == $id)' "$MEMBERS_JSON")
-  name=$(echo "$member" | jq -r '.displayName // .id')
-
-  email=$(echo "$member" | jq -r --arg fields "$ENTRA_EMAIL_FIELD" '
-    ($fields | split(",") | map(gsub("^\\s+|\\s+$"; ""))) as $priority |
-    ( first(
-        $priority[] as $f |
-        (.[$f]) |
-        if type == "array" then
-          (map(select(type == "string" and . != "")) | .[0] // empty)
-        elif type == "string" and . != "" then .
-        else empty end
-      ) // "" )
-    | sub("^(SMTP|smtp):"; "")
-  ')
+while IFS=$'\t' read -r user_id name email; do
+  [ -z "$user_id" ] && continue
 
   if [ -z "$email" ]; then
-    echo "[skip] $name: no value in any of [$ENTRA_EMAIL_FIELD]"
+    echo "[skip] $name ($user_id): no Flex username available"
     continue
   fi
 
-  echo "New user: $name <$email>"
+  case "$trigger_mode" in
+    group) echo "New user in group: $name <$email>" ;;
+    app)   echo "Unassigned from enterprise app: $name <$email>" ;;
+  esac
   encoded=$(jq -rn --arg v "$email" '$v|@uri')
   user_failed=0
 
@@ -412,13 +553,40 @@ while IFS= read -r user_id; do
   fi
 
   [ "$user_failed" = "1" ] && echo "$user_id" >> "$FAILED"
-done < "$NEW_IDS"
+done < "$TO_PROCESS"
 
-# 6. Update state: current minus failed, so failures retry next run.
-if [ -s "$FAILED" ]; then
-  comm -23 "$CURRENT_IDS" <(sort -u "$FAILED") > "$STATE_FILE"
-  fcount=$(wc -l < "$FAILED" | tr -d ' ')
-  echo "$fcount user(s) failed and will be retried next run."
+# 6. Update state.
+if [ "$trigger_mode" = "group" ]; then
+  # Group mode: state = current IDs minus failed IDs (so failures retry).
+  if [ -s "$FAILED" ]; then
+    comm -23 "$CURRENT_IDS" <(sort -u "$FAILED") > "$STATE_FILE"
+    fcount=$(wc -l < "$FAILED" | tr -d ' ')
+    echo "$fcount user(s) failed and will be retried next run."
+  else
+    cp "$CURRENT_IDS" "$STATE_FILE"
+  fi
 else
-  cp "$CURRENT_IDS" "$STATE_FILE"
+  # App mode: state = TSV row per currently-assigned user, PLUS any rows for
+  # users that failed (their previous-state row is preserved so they'll be
+  # detected as "still unassigned" next run and retried).
+  FAILED_ROWS=$(mktemp)
+  : > "$FAILED_ROWS"
+  if [ -s "$FAILED" ]; then
+    while IFS= read -r fid; do
+      awk -F'\t' -v id="$fid" '$1 == id {print; exit}' "$STATE_FILE"
+    done < "$FAILED" > "$FAILED_ROWS"
+  fi
+
+  NEW_STATE=$(mktemp)
+  while IFS= read -r uid; do
+    [ -n "$uid" ] && extract_user_row "$uid"
+  done < "$CURRENT_IDS" > "$NEW_STATE"
+  cat "$FAILED_ROWS" >> "$NEW_STATE"
+  sort -u -t $'\t' -k1,1 "$NEW_STATE" > "$STATE_FILE"
+  rm -f "$NEW_STATE" "$FAILED_ROWS"
+
+  if [ -s "$FAILED" ]; then
+    fcount=$(wc -l < "$FAILED" | tr -d ' ')
+    echo "$fcount user(s) failed and will be retried next run."
+  fi
 fi
