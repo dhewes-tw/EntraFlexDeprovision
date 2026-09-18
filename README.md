@@ -290,13 +290,24 @@ TRIGGER_MODE=app
 ENTRA_ENTERPRISE_APP_SID=<service principal Object ID>
 ```
 
+**Recommended workflow:**
+
+1. Assign the user in Entra → Enterprise applications → your app → Users and groups.
+2. Run `./provision.sh` — creates the Flex User (and TaskRouter Worker on next Flex login) and **writes the user's ID/name/email to `assigned_users.tsv`**.
+3. Later, unassign the user in Entra.
+4. Run `./deprovision.sh` — sees the user in `assigned_users.tsv` but not in the current `appRoleAssignedTo` fetch, and removes them from Flex.
+
+**Why provision.sh writes the state file too:** step 4 needs a prior snapshot of "who was assigned" to detect anyone who has since been unassigned. If only `deprovision.sh` maintained state, a user who was assigned → provisioned → unassigned before `deprovision.sh` ever ran would slip through — deprovision's first run would baseline an already-empty assignee list and do nothing. Having `provision.sh` update the same TSV closes that gap.
+
+Both scripts safely overwrite `assigned_users.tsv` with each run's fetch view of currently-assigned users. Running them in the same cron interval also works:
+
 ```bash
-# In the same cron interval:
-./provision.sh     # every current assignee ends up in Flex (skips existing)
-./deprovision.sh   # anyone unassigned since last run is cleaned up
+# e.g. every 5 minutes
+*/5 * * * * cd /opt/entraflex && ./provision.sh >> provision.log 2>&1
+*/5 * * * * cd /opt/entraflex && ./deprovision.sh >> deprovision.log 2>&1
 ```
 
-Note that **group mode has different semantics on the two scripts**: `provision.sh` treats the group as an "allow list" (provision every current member), while `deprovision.sh` treats the group as a "kick list" (act on users **added** to the group). If you want a group to work as an access list end-to-end, prefer app mode or wire up a separate "kick" group for `deprovision.sh`.
+**Group mode note.** `provision.sh` treats the group as an "allow list" (provision every current member); `deprovision.sh` treats the group as a "kick list" (act on users **added** to the group). If you want a group to work as an access list end-to-end, prefer app mode. `provision.sh` only writes the shared TSV in app mode.
 
 ---
 

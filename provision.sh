@@ -98,7 +98,8 @@ FLEX_ROLES_JSON=$(echo "$FLEX_ROLES" | jq -Rc 'split(",") | map(gsub("^\\s+|\\s+
 
 MEMBERS_JSON=$(mktemp)
 ASSIGNMENT_IDS=$(mktemp)
-trap 'rm -f "$MEMBERS_JSON" "$ASSIGNMENT_IDS"' EXIT
+STATE_TSV_TMP=$(mktemp)
+trap 'rm -f "$MEMBERS_JSON" "$ASSIGNMENT_IDS" "$STATE_TSV_TMP"' EXIT
 
 # 1. Graph token (client credentials).
 token_resp=$(curl -sS -w $'\n%{http_code}' \
@@ -271,6 +272,12 @@ for ((i = 0; i < count; i++)); do
   # full_name is required (1-256 chars); fall back to email if displayName is empty.
   full_name="${raw_name:-$email}"
 
+  # Record this user for the shared state file so deprovision.sh (app mode) can
+  # detect subsequent unassignments. In group mode this file isn't used.
+  if [ "$trigger_mode" = "app" ]; then
+    printf '%s\t%s\t%s\n' "$uid" "$(printf '%s' "$full_name" | tr '\t' ' ')" "$email" >> "$STATE_TSV_TMP"
+  fi
+
   echo "User: $full_name <$email>"
 
   encoded=$(jq -rn --arg v "$email" '$v|@uri')
@@ -332,3 +339,19 @@ done
 
 echo ""
 echo "Summary: $provisioned provisioned, $skipped skipped, $failed failed."
+
+# App mode: write/update the shared state file consumed by deprovision.sh.
+# Writing this here (rather than only in deprovision.sh) is what makes the
+# "assign → provision → unassign → deprovision" workflow reliable: without
+# a prior snapshot, deprovision has nothing to diff against.
+if [ "$trigger_mode" = "app" ]; then
+  STATE_FILE="$SCRIPT_DIR/assigned_users.tsv"
+  if [ -s "$STATE_TSV_TMP" ]; then
+    sort -u -t $'\t' -k1,1 "$STATE_TSV_TMP" > "$STATE_FILE"
+    state_count=$(wc -l < "$STATE_FILE" | tr -d ' ')
+    echo "State snapshot: $state_count user(s) written to $STATE_FILE (deprovision.sh will detect subsequent unassignments)."
+  else
+    : > "$STATE_FILE"
+    echo "State snapshot: 0 user(s) — $STATE_FILE cleared."
+  fi
+fi
