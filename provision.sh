@@ -207,7 +207,7 @@ fi
 if [ -n "${DEBUG:-}" ]; then
   count=$(jq 'length' "$MEMBERS_JSON")
   echo "=== DEBUG: $count user(s) fetched ==="
-  for i in $(seq 0 $((count - 1))); do
+  for ((i = 0; i < count; i++)); do
     member=$(jq --argjson i "$i" '.[$i]' "$MEMBERS_JSON")
     name=$(echo "$member" | jq -r '.displayName // .id')
     mid=$(echo "$member"  | jq -r '.id')
@@ -245,7 +245,7 @@ provisioned=0
 skipped=0
 failed=0
 
-for i in $(seq 0 $((count - 1))); do
+for ((i = 0; i < count; i++)); do
   member=$(jq --argjson i "$i" '.[$i]' "$MEMBERS_JSON")
   uid=$(echo "$member" | jq -r '.id')
   raw_name=$(echo "$member" | jq -r '.displayName // empty')

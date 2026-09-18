@@ -271,7 +271,7 @@ if [ -n "${DEBUG:-}" ]; then
   else
     echo "=== DEBUG: $count assignee(s) currently on enterprise app ==="
   fi
-  for i in $(seq 0 $((count - 1))); do
+  for ((i = 0; i < count; i++)); do
     mid=$(jq -r --argjson i "$i" '.[$i].id' "$MEMBERS_JSON")
     echo ""
     echo "----- id: $mid -----"
