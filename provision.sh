@@ -153,7 +153,31 @@ else
       echo "Graph appRoleAssignedTo request failed: HTTP $page_status" >&2
       echo "URL: $url" >&2
       echo "$page" >&2
-      [ "$page_status" = "403" ] && echo "Hint: app registration likely lacks Application.Read.All (Application) with admin consent granted." >&2
+      case "$page_status" in
+        403)
+          echo "Hint: app registration likely lacks Application.Read.All (Application) with admin consent granted." >&2
+          ;;
+        404)
+          echo "" >&2
+          echo "Hint: ENTRA_ENTERPRISE_APP_SID must be the servicePrincipal Object ID from" >&2
+          echo "  Entra portal → Enterprise applications → your app → Properties → Object ID." >&2
+          echo "  It is NOT the Application (client) ID and NOT the Object ID from App registrations." >&2
+          echo "  Attempting to resolve '$ENTRA_ENTERPRISE_APP_SID' as an appId..." >&2
+          resolve=$(curl -sS -H "Authorization: Bearer $TOKEN" \
+            "https://graph.microsoft.com/v1.0/servicePrincipals?\$filter=appId%20eq%20'$ENTRA_ENTERPRISE_APP_SID'&\$select=id,displayName,appId")
+          sp_id=$(echo "$resolve" | jq -r '.value[0].id // empty')
+          sp_name=$(echo "$resolve" | jq -r '.value[0].displayName // empty')
+          if [ -n "$sp_id" ]; then
+            echo "  Found a servicePrincipal whose appId matches:" >&2
+            echo "    displayName: $sp_name" >&2
+            echo "    Object ID:   $sp_id" >&2
+            echo "  → Update .env: ENTRA_ENTERPRISE_APP_SID=$sp_id" >&2
+          else
+            echo "  No servicePrincipal has appId == '$ENTRA_ENTERPRISE_APP_SID' either." >&2
+            echo "  Double-check the Object ID from the Enterprise applications blade." >&2
+          fi
+          ;;
+      esac
       exit 1
     fi
     echo "$page" | jq -r '.value[] | select(.principalType == "User") | .principalId' >> "$ASSIGNMENT_IDS"

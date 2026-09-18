@@ -114,11 +114,15 @@ The group may contain nested groups, service principals, or devices — the scri
 
 ### 1.6  Find the Enterprise App's Object ID (app mode)
 
-1. Left nav → **Applications → Enterprise applications** (**not** App registrations — those are different objects).
+**Watch out — three GUIDs are visible for the same app in the portal, and only one is correct.** The script needs the **servicePrincipal Object ID**, which is different from the Application (client) ID *and* from the App registration's Object ID.
+
+1. Left nav → **Applications → Enterprise applications** (**not** App registrations — those are a different directory object).
 2. Find and click the app whose assignments you want to watch (typically your Flex SSO app, but any Enterprise Application works).
-3. On the **Properties** page, copy the **Object ID** (a GUID — this is the service principal's Object ID, distinct from the Application ID / Client ID).
+3. Left nav on the app → **Properties**. Copy the **Object ID** from this page. Do **not** use the "Application ID" shown on the Overview page — that's the appId.
 4. This is `ENTRA_ENTERPRISE_APP_SID` in `.env`.
 5. Set `TRIGGER_MODE=app` in `.env`.
+
+If you paste the wrong ID, both scripts detect the 404 and try to resolve your value as an appId, printing the correct servicePrincipal Object ID if it matches.
 
 Only users assigned via **Users and groups** (as User principals, not through nested groups) are detected. Group-based assignments to the Enterprise App won't fire the unassign trigger for individual users when they leave one of those groups — the app just sees the group as still assigned.
 
