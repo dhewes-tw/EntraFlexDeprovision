@@ -231,7 +231,14 @@ else
       esac
       exit 1
     fi
-    echo "$page" | jq -r '.value[] | select(.principalType == "User") | .principalId' >> "$ASSIGNMENT_IDS"
+    # Count User assignments with null principalId (stale rows for deleted users)
+    # so we can warn about them rather than emitting "null" into ASSIGNMENT_IDS.
+    total_users=$(echo "$page" | jq -r '[.value[] | select(.principalType == "User")] | length')
+    kept_users=$(echo "$page"  | jq -r '[.value[] | select(.principalType == "User") | select(.principalId != null)] | length')
+    if [ "$total_users" != "$kept_users" ]; then
+      echo "Warning: skipped $((total_users - kept_users)) User assignment(s) with null principalId on this page (likely stale rows for deleted users)." >&2
+    fi
+    echo "$page" | jq -r '.value[] | select(.principalType == "User") | select(.principalId != null) | .principalId' >> "$ASSIGNMENT_IDS"
     url=$(echo "$page" | jq -r '."@odata.nextLink" // empty')
   done
   # Fetch full profile per assigned user.
@@ -268,17 +275,23 @@ if [ -n "${DEBUG:-}" ]; then
     mid=$(jq -r --argjson i "$i" '.[$i].id' "$MEMBERS_JSON")
     echo ""
     echo "----- id: $mid -----"
-    user_resp=$(curl -sS -w $'\n%{http_code}' -H "Authorization: Bearer $TOKEN" \
-      "https://graph.microsoft.com/v1.0/users/$mid?\$select=$user_select")
-    user_status=$(echo "$user_resp" | tail -n1)
-    user_body=$(echo "$user_resp"   | sed '$d')
-    if [ "$user_status" != "200" ]; then
-      echo "  /users/$mid failed: HTTP $user_status"
-      echo "  $user_body"
-      if [ "$user_status" = "403" ]; then
-        echo "  Hint: add User.Read.All (Application) to the app registration and grant admin consent."
+    if [ "$trigger_mode" = "app" ]; then
+      # App mode: MEMBERS_JSON already contains the full profile fetched
+      # in step 2 — use it directly instead of re-fetching.
+      user_body=$(jq -c --argjson i "$i" '.[$i]' "$MEMBERS_JSON")
+    else
+      # Group mode: /groups/{id}/members returns trimmed user objects, so
+      # re-fetch each via /users/{id} for the broader $select.
+      user_resp=$(curl -sS -w $'\n%{http_code}' -H "Authorization: Bearer $TOKEN" \
+        "https://graph.microsoft.com/v1.0/users/$mid?\$select=$user_select")
+      user_status=$(echo "$user_resp" | tail -n1)
+      user_body=$(echo "$user_resp"   | sed '$d')
+      if [ "$user_status" != "200" ]; then
+        echo "  /users/$mid failed: HTTP $user_status"
+        echo "  $user_body"
+        [ "$user_status" = "403" ] && echo "  Hint: add User.Read.All (Application) to the app registration and grant admin consent."
+        continue
       fi
-      continue
     fi
     echo "Fields containing '@' (candidates for ENTRA_EMAIL_FIELD):"
     echo "$user_body" | jq -r '

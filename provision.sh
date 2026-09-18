@@ -180,7 +180,12 @@ else
       esac
       exit 1
     fi
-    echo "$page" | jq -r '.value[] | select(.principalType == "User") | .principalId' >> "$ASSIGNMENT_IDS"
+    total_users=$(echo "$page" | jq -r '[.value[] | select(.principalType == "User")] | length')
+    kept_users=$(echo "$page"  | jq -r '[.value[] | select(.principalType == "User") | select(.principalId != null)] | length')
+    if [ "$total_users" != "$kept_users" ]; then
+      echo "Warning: skipped $((total_users - kept_users)) User assignment(s) with null principalId on this page (likely stale rows for deleted users)." >&2
+    fi
+    echo "$page" | jq -r '.value[] | select(.principalType == "User") | select(.principalId != null) | .principalId' >> "$ASSIGNMENT_IDS"
     url=$(echo "$page" | jq -r '."@odata.nextLink" // empty')
   done
   while IFS= read -r pid; do
