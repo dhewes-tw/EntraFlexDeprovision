@@ -31,6 +31,33 @@
 
 set -euo pipefail
 
+usage() {
+  cat <<'USAGE'
+Usage: provision.sh [-f|--force] [-n|--dry-run] [-h|--help]
+
+  -n, --dry-run   Print the list of users that would be provisioned and exit
+                  without making any changes. Never prompts. Overrides --force.
+  -f, --force     Skip the confirmation prompt. Required for non-interactive
+                  (cron / no-TTY) runs.
+  -h, --help      Show this help and exit.
+
+Default: interactive. Prints a summary of the users that will be provisioned
+and requires typing "yes" to proceed.
+USAGE
+}
+
+FORCE=0
+DRY_RUN=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -f|--force)   FORCE=1 ;;
+    -n|--dry-run) DRY_RUN=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
 command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
 command -v jq   >/dev/null 2>&1 || { echo "jq is required (brew install jq / apt install jq)" >&2; exit 1; }
 
@@ -99,7 +126,8 @@ FLEX_ROLES_JSON=$(echo "$FLEX_ROLES" | jq -Rc 'split(",") | map(gsub("^\\s+|\\s+
 MEMBERS_JSON=$(mktemp)
 ASSIGNMENT_IDS=$(mktemp)
 STATE_TSV_TMP=$(mktemp)
-trap 'rm -f "$MEMBERS_JSON" "$ASSIGNMENT_IDS" "$STATE_TSV_TMP"' EXIT
+TO_PROVISION=$(mktemp)
+trap 'rm -f "$MEMBERS_JSON" "$ASSIGNMENT_IDS" "$STATE_TSV_TMP" "$TO_PROVISION"' EXIT
 
 # 1. Graph token (client credentials).
 token_resp=$(curl -sS -w $'\n%{http_code}' \
@@ -235,16 +263,15 @@ if [ -n "${DEBUG:-}" ]; then
   echo ""
 fi
 
-# 4. Iterate members: skip already-provisioned, provision the rest.
+# 4. Discovery pass: classify each Entra user into (to-provision, already-in-Flex,
+# no-email). Actual mutations happen in the mutation pass below, after the summary
+# and confirmation prompt.
 count=$(jq 'length' "$MEMBERS_JSON")
-if [ "$count" = "0" ]; then
-  echo "No users to provision."
-  exit 0
-fi
 
-provisioned=0
-skipped=0
-failed=0
+skipped_no_email=0
+skipped_already=0
+discovery_failed=0
+: > "$TO_PROVISION"
 
 for ((i = 0; i < count; i++)); do
   member=$(jq --argjson i "$i" '.[$i]' "$MEMBERS_JSON")
@@ -264,8 +291,8 @@ for ((i = 0; i < count; i++)); do
   ')
 
   if [ -z "$email" ]; then
-    echo "[skip] ${raw_name:-$uid}: no value in any of [$ENTRA_EMAIL_FIELD]"
-    skipped=$((skipped + 1))
+    echo "[skip] ${raw_name:-$uid}: no value in any of [$ENTRA_EMAIL_FIELD]" >&2
+    skipped_no_email=$((skipped_no_email + 1))
     continue
   fi
 
@@ -278,11 +305,8 @@ for ((i = 0; i < count; i++)); do
     printf '%s\t%s\t%s\n' "$uid" "$(printf '%s' "$full_name" | tr '\t' ' ')" "$email" >> "$STATE_TSV_TMP"
   fi
 
-  echo "User: $full_name <$email>"
-
   encoded=$(jq -rn --arg v "$email" '$v|@uri')
   lookup_url="$FLEX_BASE/Users?Username=$encoded"
-  echo "  GET $lookup_url"
   lookup=$(curl -sS -w $'\n%{http_code}' \
     -u "$TWILIO_API_KEY:$TWILIO_API_SECRET" \
     "$lookup_url")
@@ -290,55 +314,108 @@ for ((i = 0; i < count; i++)); do
   lbody=$(echo "$lookup"   | sed '$d')
 
   if [ "$lstatus" != "200" ]; then
-    echo "  Lookup failed: HTTP $lstatus - $lbody"
-    failed=$((failed + 1))
+    echo "[warn] Flex lookup for $email failed: HTTP $lstatus - $lbody" >&2
+    discovery_failed=$((discovery_failed + 1))
     continue
   fi
 
   existing_sid=$(echo "$lbody" | jq -r '(.users // .Users // [])[0] | (.flex_user_sid // .sid // empty)')
   if [ -n "$existing_sid" ]; then
-    echo "  Already provisioned (Flex SID: $existing_sid) — skipping"
-    skipped=$((skipped + 1))
+    skipped_already=$((skipped_already + 1))
     continue
   fi
 
-  provision_body=$(jq -nc \
-    --arg username "$email" \
-    --arg email    "$email" \
-    --arg fullname "$full_name" \
-    --argjson roles "$FLEX_ROLES_JSON" \
-    --argjson worker "$FLEX_WORKER_JSON" \
-    '{username: $username, email: $email, full_name: $fullname, roles: $roles, worker: $worker}')
-
-  provision_url="$FLEX_BASE/Users/Provision"
-  echo "  POST $provision_url"
-  echo "  Body: $provision_body"
-
-  provision=$(curl -sS -w $'\n%{http_code}' -X POST \
-    -u "$TWILIO_API_KEY:$TWILIO_API_SECRET" \
-    -H "Content-Type: application/json" \
-    -d "$provision_body" \
-    "$provision_url")
-  pstatus=$(echo "$provision" | tail -n1)
-  pbody=$(echo "$provision"   | sed '$d')
-
-  echo "  Response: HTTP $pstatus"
-  case "$pstatus" in
-    200|201|202)
-      created_sid=$(echo "$pbody" | jq -r '.flex_user_sid // .sid // empty')
-      echo "  Provisioned. Flex SID: $created_sid"
-      echo "  Body: $(echo "$pbody" | jq -c '.')"
-      provisioned=$((provisioned + 1))
-      ;;
-    *)
-      echo "  Provision FAILED. Body: $(echo "$pbody" | jq -c '.' 2>/dev/null || echo "$pbody")"
-      failed=$((failed + 1))
-      ;;
-  esac
+  printf '%s\t%s\t%s\n' "$uid" "$(printf '%s' "$full_name" | tr '\t' ' ')" "$email" >> "$TO_PROVISION"
 done
 
+to_count=$(wc -l < "$TO_PROVISION" | tr -d ' ')
+
+# 5. Summary + confirmation.
 echo ""
-echo "Summary: $provisioned provisioned, $skipped skipped, $failed failed."
+if [ "$to_count" = "0" ]; then
+  echo "Nothing to provision."
+else
+  echo "The following $to_count user(s) will be Provisioned:"
+  idx=0
+  while IFS=$'\t' read -r _uid _name _email; do
+    idx=$((idx + 1))
+    printf '  %d. %s <%s>\n' "$idx" "$_name" "$_email"
+  done < "$TO_PROVISION"
+fi
+echo ""
+echo "Also: $skipped_already already provisioned (will skip), $skipped_no_email with no email (will skip), $discovery_failed lookup failure(s)."
+
+if [ "$DRY_RUN" = "1" ]; then
+  echo ""
+  echo "Dry run — no changes made."
+  # Still update the app-mode state file below (side-effect of discovery, not mutation).
+  provisioned=0
+  skipped=$((skipped_already + skipped_no_email))
+  failed=0
+elif [ "$to_count" = "0" ]; then
+  provisioned=0
+  skipped=$((skipped_already + skipped_no_email))
+  failed=0
+else
+  if [ "$FORCE" != "1" ]; then
+    if [ ! -t 0 ]; then
+      echo "error: non-interactive shell requires --force (or --dry-run)" >&2
+      exit 1
+    fi
+    read -r -p 'Type "yes" to proceed: ' answer
+    if [ "$answer" != "yes" ]; then
+      echo "Aborted — no changes made."
+      exit 0
+    fi
+  fi
+
+  # 6. Mutation pass: provision every user in TO_PROVISION.
+  provisioned=0
+  skipped=$((skipped_already + skipped_no_email))
+  failed=$discovery_failed
+
+  while IFS=$'\t' read -r uid full_name email; do
+    [ -z "$email" ] && continue
+    echo "User: $full_name <$email>"
+
+    provision_body=$(jq -nc \
+      --arg username "$email" \
+      --arg email    "$email" \
+      --arg fullname "$full_name" \
+      --argjson roles "$FLEX_ROLES_JSON" \
+      --argjson worker "$FLEX_WORKER_JSON" \
+      '{username: $username, email: $email, full_name: $fullname, roles: $roles, worker: $worker}')
+
+    provision_url="$FLEX_BASE/Users/Provision"
+    echo "  POST $provision_url"
+    echo "  Body: $provision_body"
+
+    provision=$(curl -sS -w $'\n%{http_code}' -X POST \
+      -u "$TWILIO_API_KEY:$TWILIO_API_SECRET" \
+      -H "Content-Type: application/json" \
+      -d "$provision_body" \
+      "$provision_url")
+    pstatus=$(echo "$provision" | tail -n1)
+    pbody=$(echo "$provision"   | sed '$d')
+
+    echo "  Response: HTTP $pstatus"
+    case "$pstatus" in
+      200|201|202)
+        created_sid=$(echo "$pbody" | jq -r '.flex_user_sid // .sid // empty')
+        echo "  Provisioned. Flex SID: $created_sid"
+        echo "  Body: $(echo "$pbody" | jq -c '.')"
+        provisioned=$((provisioned + 1))
+        ;;
+      *)
+        echo "  Provision FAILED. Body: $(echo "$pbody" | jq -c '.' 2>/dev/null || echo "$pbody")"
+        failed=$((failed + 1))
+        ;;
+    esac
+  done < "$TO_PROVISION"
+
+  echo ""
+  echo "Summary: $provisioned provisioned, $skipped skipped, $failed failed."
+fi
 
 # App mode: write/update the shared state file consumed by deprovision.sh.
 # Writing this here (rather than only in deprovision.sh) is what makes the

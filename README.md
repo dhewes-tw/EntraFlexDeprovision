@@ -187,6 +187,16 @@ FLEX_INSTANCE_SID=GOxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 ## Running
 
+Both scripts prompt for confirmation by default. On a normal run, the script gathers the affected users, prints a summary of who **will be Provisioned** or **De-Provisioned**, and then waits for you to type `yes` to proceed. Any other input aborts before any Flex mutation happens.
+
+Flags (available on both `provision.sh` and `deprovision.sh`):
+
+| Flag | Effect |
+| --- | --- |
+| `-n`, `--dry-run` | Print the summary and exit 0. Never prompts, never mutates. Overrides `--force`. For `deprovision.sh` the state file is also left untouched, so a subsequent run re-detects the same users. |
+| `-f`, `--force` | Skip the confirmation prompt. **Required for non-interactive runs (cron, no TTY)** — otherwise the script exits 1 with an error. |
+| `-h`, `--help` | Show usage and exit. |
+
 ### First run
 
 Processes every current member of the group:
@@ -194,7 +204,14 @@ Processes every current member of the group:
 ```bash
 ./deprovision.sh
 # → First run — no state file. Processing all N current member(s).
-# → New user: ...
+# →
+# → The following 3 user(s) will be De-Provisioned:
+# →   1. Jane Doe <jane@contoso.com>
+# →   2. ...
+# →
+# → Type "yes" to proceed: yes
+# → Unassigned from enterprise app: Jane Doe <jane@contoso.com>
+# →   ...
 ```
 
 ### Every subsequent run
@@ -205,9 +222,20 @@ Only members added since the last run get processed:
 ./deprovision.sh
 # → No new users.
 # or
-# → New user: Jane Doe <jane@contoso.com>
-#     Flex SID: FUxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx — deprovisioning...
-#     Deprovisioned.
+# → The following 1 user(s) will be De-Provisioned:
+# →   1. Jane Doe <jane@contoso.com>
+# → Type "yes" to proceed: yes
+# →   Flex SID: FUxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx — deprovisioning...
+# →   Deprovisioned.
+```
+
+### Preview (dry-run)
+
+Show what would happen without touching Flex or the state file:
+
+```bash
+./deprovision.sh --dry-run
+./provision.sh -n
 ```
 
 ### Debug mode — inspect what Graph returns per member
@@ -227,8 +255,10 @@ For each member, DEBUG mode prints:
 Poll every 5 minutes and log to a file:
 
 ```
-*/5 * * * * cd /opt/entraflex && ./deprovision.sh >> run.log 2>&1
+*/5 * * * * cd /opt/entraflex && ./deprovision.sh --force >> run.log 2>&1
 ```
+
+The `--force` flag is required for non-interactive runs — without it, the script exits 1 rather than silently mutating Flex.
 
 Adjust the interval per your needs. Ensure the process running cron has read/write access to `seen_users.txt` next to the script.
 
@@ -268,14 +298,16 @@ FLEX_WORKER_JSON={"attributes":{"channel.voice.capacity":10}}
 
 ```bash
 ./provision.sh
+# → The following 1 user(s) will be Provisioned:
+# →   1. Jane Doe <jane@contoso.com>
+# →
+# → Also: 1 already provisioned (will skip), 0 with no email (will skip), 0 lookup failure(s).
+# → Type "yes" to proceed: yes
 # → User: Jane Doe <jane@contoso.com>
-#     GET https://flex-api.twilio.com/v4/Instances/GO.../Users?Username=jane%40contoso.com
-#     POST https://flex-api.twilio.com/v4/Instances/GO.../Users/Provision
-#     Body: {"username":"jane@contoso.com","email":"jane@contoso.com","full_name":"Jane Doe","roles":["agent"],"worker":{}}
-#     Response: HTTP 201
-#     Provisioned. Flex SID: FU...
-# → User: Bob Smith <bob@contoso.com>
-#     Already provisioned (Flex SID: FU...) — skipping
+# →   POST https://flex-api.twilio.com/v4/Instances/GO.../Users/Provision
+# →   Body: {"username":"jane@contoso.com","email":"jane@contoso.com","full_name":"Jane Doe","roles":["agent"],"worker":{}}
+# →   Response: HTTP 201
+# →   Provisioned. Flex SID: FU...
 # → Summary: 1 provisioned, 1 skipped, 0 failed.
 ```
 
@@ -302,9 +334,9 @@ ENTRA_ENTERPRISE_APP_SID=<service principal Object ID>
 Both scripts safely overwrite `assigned_users.tsv` with each run's fetch view of currently-assigned users. Running them in the same cron interval also works:
 
 ```bash
-# e.g. every 5 minutes
-*/5 * * * * cd /opt/entraflex && ./provision.sh >> provision.log 2>&1
-*/5 * * * * cd /opt/entraflex && ./deprovision.sh >> deprovision.log 2>&1
+# e.g. every 5 minutes — --force skips the confirmation prompt (required in cron)
+*/5 * * * * cd /opt/entraflex && ./provision.sh --force >> provision.log 2>&1
+*/5 * * * * cd /opt/entraflex && ./deprovision.sh --force >> deprovision.log 2>&1
 ```
 
 **Group mode note.** `provision.sh` treats the group as an "allow list" (provision every current member); `deprovision.sh` treats the group as a "kick list" (act on users **added** to the group). If you want a group to work as an access list end-to-end, prefer app mode. `provision.sh` only writes the shared TSV in app mode.

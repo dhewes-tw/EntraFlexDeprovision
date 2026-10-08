@@ -26,6 +26,35 @@
 
 set -euo pipefail
 
+usage() {
+  cat <<'USAGE'
+Usage: deprovision.sh [-f|--force] [-n|--dry-run] [-h|--help]
+
+  -n, --dry-run   Print the list of users that would be deprovisioned and exit
+                  without making any changes (state file is not updated either,
+                  so a subsequent run will re-detect the same users). Never
+                  prompts. Overrides --force.
+  -f, --force     Skip the confirmation prompt. Required for non-interactive
+                  (cron / no-TTY) runs.
+  -h, --help      Show this help and exit.
+
+Default: interactive. Prints a summary of the users that will be deprovisioned
+and requires typing "yes" to proceed.
+USAGE
+}
+
+FORCE=0
+DRY_RUN=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -f|--force)   FORCE=1 ;;
+    -n|--dry-run) DRY_RUN=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
 command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
 command -v jq   >/dev/null 2>&1 || { echo "jq is required (brew install jq / apt install jq)" >&2; exit 1; }
 
@@ -445,14 +474,46 @@ else
   rm -f "$STATE_IDS" "$REMOVED_IDS"
 fi
 
-# 5. Iterate TO_PROCESS: (id, name, email) — Flex v4 deprovision + TR worker delete.
+# 5. Summary + confirmation prompt.
 if [ ! -s "$TO_PROCESS" ]; then
   case "$trigger_mode" in
     group) echo "No new users." ;;
     app)   echo "No users to process." ;;
   esac
+else
+  to_count=$(wc -l < "$TO_PROCESS" | tr -d ' ')
+  echo ""
+  echo "The following $to_count user(s) will be De-Provisioned:"
+  idx=0
+  while IFS=$'\t' read -r _uid _name _email; do
+    idx=$((idx + 1))
+    if [ -n "$_email" ]; then
+      printf '  %d. %s <%s>\n' "$idx" "$_name" "$_email"
+    else
+      printf '  %d. %s (no Flex username — will skip)\n' "$idx" "${_name:-$_uid}"
+    fi
+  done < "$TO_PROCESS"
+  echo ""
+
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "Dry run — no changes made. State file not updated."
+    exit 0
+  fi
+
+  if [ "$FORCE" != "1" ]; then
+    if [ ! -t 0 ]; then
+      echo "error: non-interactive shell requires --force (or --dry-run)" >&2
+      exit 1
+    fi
+    read -r -p 'Type "yes" to proceed: ' answer
+    if [ "$answer" != "yes" ]; then
+      echo "Aborted — no changes made. State file not updated."
+      exit 0
+    fi
+  fi
 fi
 
+# 6. Iterate TO_PROCESS: (id, name, email) — Flex v4 deprovision + TR worker delete.
 while IFS=$'\t' read -r user_id name email; do
   [ -z "$user_id" ] && continue
 

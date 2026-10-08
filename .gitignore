@@ -5,6 +5,7 @@
 
 # Runtime state
 seen_users.txt
+assigned_users.tsv
 *.log
 
 # Python (only relevant if you use deprovision.py)
